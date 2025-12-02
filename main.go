@@ -8,109 +8,137 @@ import (
 	"github.com/go-rod/rod/lib/launcher"
 )
 
+// 配置区：请根据实际情况修改
+const (
+	// 评教列表的主页地址
+	MainListURL = "http://teachingevaluationsystem.cn/courses"
+
+	// 列表页：进入评价的按钮特征 (比如 "去评价", "未评", "评价")
+	// 建议找那些状态为“未完成”的按钮上的字
+	EntryBtnText = "评价"
+
+	// 详情页：最后提交按钮的文字
+	SubmitBtnText = "提交"
+
+	// 详情页：确认弹窗的按钮文字 (Vant UI 点击提交后通常会有个“确认”弹窗)
+	ConfirmBtnText = "确定"
+)
+
 func main() {
-	// ==========================================
-	// 1. 基础设置（只执行一次）
-	// ==========================================
+	// 1. 初始化
 	u := launcher.New().Headless(false).MustLaunch()
 	browser := rod.New().ControlURL(u).MustConnect()
 	defer browser.MustClose()
 
-	// 获取当前页面对象
-	// 如果你手动导航，page 对象通常会自动跟随当前标签页
-	page := browser.MustPage("http://teachingevaluationsystem.cn/courses")
+	page := browser.MustPage(MainListURL)
 
 	fmt.Println(">>> 浏览器已启动...")
-	fmt.Println(">>> 步骤1：请在浏览器中【手动登录】。")
-	fmt.Println(">>> 步骤2：请手动进入【第一个】需要评价的老师页面。")
-	fmt.Println(">>> 步骤3：准备好后，回到这里按【回车】开始...")
+	fmt.Println(">>> 请手动登录。登录成功后，请确保页面停留在【评教列表页】。")
+	fmt.Println(">>> 确认可以开始后，按【回车】启动全自动模式...")
 	fmt.Scanln()
 
-	// ==========================================
-	// 2. 外层循环：针对“每个老师”
-	// ==========================================
-	teacherCounter := 1
+	// 2. 死循环：只要列表页还有“去评价”的按钮，就一直干活
+	for {
+		fmt.Println("\n========== 正在检查列表页任务 ==========")
+
+		// 确保我们在列表页
+		if page.MustInfo().URL != MainListURL {
+			page.MustNavigate(MainListURL)
+			page.MustWaitLoad()
+			time.Sleep(2 * time.Second) // 等列表加载
+		}
+
+		// 查找第一个可用的入口按钮
+		// 这里使用模糊匹配：查找所有包含 EntryBtnText (例如"评价") 的元素
+		// 并且它应该是 clickable 的
+		entryXPath := fmt.Sprintf("//*[contains(text(), '%s')]", EntryBtnText)
+
+		// 搜索页面上是否还有这个按钮
+		// 我们只拿第一个 (First)，评完一个回来再拿下一个
+		hasTask, entryBtn, _ := page.HasX(entryXPath)
+
+		if !hasTask {
+			fmt.Println("列表页找不到包含“" + EntryBtnText + "”的按钮了。")
+			fmt.Println("恭喜！所有评价可能已完成。")
+			break // 结束整个程序
+		}
+
+		fmt.Println("发现待评价课程，准备进入...")
+
+		// 点击进入详情页
+		entryBtn.MustEval("() => this.click()")
+
+		// 等待详情页加载
+		time.Sleep(2 * time.Second)
+
+		// === 执行单个老师的评价逻辑 ===
+		processCurrentTeacher(page)
+
+		// 评价完一个后，循环会回到开头，重新刷新列表页，找下一个
+	}
+}
+
+// processCurrentTeacher 处理单个老师的所有页面和提交
+func processCurrentTeacher(page *rod.Page) {
+	pageCounter := 1
 
 	for {
-		fmt.Printf("\n========== 正在开始第 %d 位老师的自动评价 ==========\n", teacherCounter)
+		fmt.Printf("   [第 %d 页] 正在自动勾选...\n", pageCounter)
 
-		// --- 每次开始新老师时，重置页码计数器 ---
-		pageCounter := 1
+		// 1. 勾选“非常满意” (复用之前的逻辑)
+		xpath := "//span[contains(text(), '非常满意')]"
+		// 使用 Race 避免找不到元素报错
+		if elements, err := page.ElementsX(xpath); err == nil {
+			for _, el := range elements {
+				// 忽略错误，强制点击
+				func() {
+					defer func() { recover() }()
+					el.MustEval("() => this.click()")
+				}()
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
 
-		// ==========================================
-		// 3. 内层循环：针对“每一页”
-		// ==========================================
-		for {
-			fmt.Printf("   [第 %d 页] 正在扫描选项...\n", pageCounter)
+		// 2. 判断是“翻页”还是“提交”
+		// 先找下一页
+		nextBtnXPath := "//*[contains(., '下一')]" // 你的翻页按钮文字
+		hasNext, nextBtn, _ := page.HasX(nextBtnXPath)
 
-			// --------------------------------------
-			// A. 查找并勾选当前页的所有选项
-			// --------------------------------------
-			xpath := "//span[contains(text(), '非常满意')]"
+		if hasNext {
+			// --- 有下一页，继续翻 ---
+			fmt.Println("   -> 翻页...")
+			nextBtn.MustEval("() => this.click()")
+			time.Sleep(1 * time.Second)
+			pageCounter++
+		} else {
+			// --- 没有下一页了，说明到底了，找提交按钮 ---
+			fmt.Println("   -> 已到最后一页，查找提交按钮...")
 
-			// 使用 Race 机制来防止页面加载慢导致的报错，或者页面其实已经没有题目了
-			// 这里简单处理：直接找元素
-			elements, err := page.ElementsX(xpath)
+			submitXPath := fmt.Sprintf("//button[contains(., '%s')] | //div[contains(., '%s') and contains(@class, 'btn')]", SubmitBtnText, SubmitBtnText)
 
-			if err != nil || len(elements) == 0 {
-				fmt.Println("   ! 未找到“非常满意”选项 (可能是网络卡顿或已无题目)。")
-			} else {
-				fmt.Printf("   -> 发现 %d 个题目，正在执行 JS 点击...\n", len(elements))
-				for _, el := range elements {
-					// 忽略错误，强制点击
-					func() {
-						defer func() { recover() }()
-						el.MustEval("() => this.click()")
-					}()
-					time.Sleep(20 * time.Millisecond) //稍微快一点
+			hasSubmit, submitBtn, _ := page.HasX(submitXPath)
+			if hasSubmit {
+				fmt.Println("   -> 点击提交！")
+				submitBtn.MustEval("() => this.click()")
+
+				// 3. 处理可能出现的“确认提交”弹窗
+				// Vant UI 通常会弹出一个 Dialog 让你点“确定”
+				time.Sleep(1 * time.Second) // 等弹窗出来
+
+				confirmXPath := fmt.Sprintf("//button[contains(., '%s')]", ConfirmBtnText)
+				if hasConfirm, confirmBtn, _ := page.HasX(confirmXPath); hasConfirm {
+					fmt.Println("   -> 确认弹窗...")
+					confirmBtn.MustClick()
 				}
-			}
 
-			// --------------------------------------
-			// B. 查找“下一页”并翻页
-			// --------------------------------------
-			// 使用你刚才测试成功的那个 XPath（如果不确定，就用下面这个宽容模式）
-			nextBtnXPath := "//*[contains(., '下一')]"
-
-			hasNext, nextBtn, _ := page.HasX(nextBtnXPath)
-
-			if hasNext {
-				fmt.Println("   -> 检测到【下一页/下一步】，正在翻页...")
-
-				// 点击翻页
-				nextBtn.MustEval("() => this.click()")
-
-				// 等待新页面加载 (重要！)
-				time.Sleep(1 * time.Second)
-				pageCounter++
+				fmt.Println("✅ 本课程评价完成！等待返回列表...")
+				time.Sleep(3 * time.Second) // 等待提交请求完成并跳转
+				return                      // 退出函数，回到 Main 的列表循环
 			} else {
-				// 没有下一页了，说明这个老师评完了
-				fmt.Println("   -> 未检测到下一页按钮，本位老师评价结束。")
-				break // 跳出内层循环 (Page Loop)
+				fmt.Println("❌ 既没有下一页，也没找到提交按钮，可能出错了。")
+				// 这种情况下，为了防止死循环，我们强制回退
+				return
 			}
 		}
-
-		// ==========================================
-		// 4. 单个老师结束后的交互
-		// ==========================================
-		fmt.Println("\n✅ 第", teacherCounter, "位老师评价完成！")
-		fmt.Println("--------------------------------------------------")
-		fmt.Println("请执行以下操作：")
-		fmt.Println("1. 在浏览器手动点击【提交】。")
-		fmt.Println("2. 点击【返回】列表。")
-		fmt.Println("3. 点击进入【下一位老师】的页面。")
-		fmt.Println("--------------------------------------------------")
-		fmt.Println(">>> 准备好评下一位了吗？按【回车】继续 (输入 q 并回车退出)...")
-
-		var input string
-		fmt.Scanln(&input) // 等待用户按回车
-
-		if input == "q" {
-			fmt.Println("退出程序。辛苦了！")
-			break // 跳出外层循环，结束程序
-		}
-
-		teacherCounter++
-		// 循环回到开头，pageCounter 会被重置，继续评下一个
 	}
 }
